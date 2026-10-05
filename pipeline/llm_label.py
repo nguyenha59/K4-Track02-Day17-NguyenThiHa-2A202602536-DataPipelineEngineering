@@ -18,6 +18,7 @@ real model (swap in any provider via .env if you like — the pipeline is the sa
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -80,14 +81,60 @@ def live_tickets(con: duckdb.DuckDBPyConnection) -> list[tuple[str, str]]:
     """).fetchall()
 
 
+def input_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def label_tickets(con: duckdb.DuckDBPyConnection, llm: FakeLLM) -> dict:
-    """NAIVE version (shipped): one LLM call per ticket per run, no validation."""
-    rows = []
-    for ticket_id, text in live_tickets(con):
+    """Label every live ticket, calling the LLM only for (input, model, prompt) never seen.
+
+    Every raw answer is cached — off-schema ones too, so a re-run does not pay
+    for them again. Valid labels go to Gold; invalid ones to llm_label_quarantine.
+    """
+    prompt_version = PROMPT_VERSION      # read at call time: a new version re-labels on purpose
+    con.execute("""CREATE TABLE IF NOT EXISTS llm_label_cache (
+        input_hash VARCHAR, model VARCHAR, prompt_version VARCHAR, raw VARCHAR,
+        PRIMARY KEY (input_hash, model, prompt_version))""")
+
+    tickets = [(tid, text, input_hash(text)) for tid, text in live_tickets(con)]
+    cached = {h for (h,) in con.execute(
+        "SELECT input_hash FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [llm.model, prompt_version]).fetchall()}
+    todo = {h: text for _, text, h in tickets if h not in cached}
+
+    # Rule 3: estimate the cost of what we are about to send, before sending it.
+    est_tokens = estimate_tokens(list(todo.values()))
+    est_usd = est_tokens / 1000 * PRICE_PER_1K_TOKENS_USD
+
+    calls_before = llm.calls
+    for h, text in sorted(todo.items()):
         raw = llm.complete(PROMPT_TEMPLATE.format(text=text))
-        rows.append((ticket_id, raw, MODEL, PROMPT_VERSION))
+        con.execute("INSERT INTO llm_label_cache VALUES (?, ?, ?, ?)",
+                    [h, llm.model, prompt_version, raw])
+
+    answers = dict(con.execute(
+        "SELECT input_hash, raw FROM llm_label_cache WHERE model = ? AND prompt_version = ?",
+        [llm.model, prompt_version]).fetchall())
+    good, bad = [], []
+    for ticket_id, _, h in tickets:
+        raw = answers[h]
+        label = parse_label(raw)
+        if label is None:
+            bad.append((ticket_id, h, llm.model, prompt_version, raw, "off-schema answer"))
+        else:
+            good.append((ticket_id, label, h, llm.model, prompt_version))
+
+    # Gold and quarantine are derived from the cache -> rebuilt in full, idempotent.
     con.execute("""CREATE OR REPLACE TABLE gold_ticket_labels (
-        ticket_id VARCHAR, label VARCHAR, model VARCHAR, prompt_version VARCHAR)""")
-    if rows:
-        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?)", rows)
-    return {"labeled": len(rows), "calls": llm.calls}
+        ticket_id VARCHAR, label VARCHAR, input_hash VARCHAR, model VARCHAR,
+        prompt_version VARCHAR)""")
+    con.execute("""CREATE OR REPLACE TABLE llm_label_quarantine (
+        ticket_id VARCHAR, input_hash VARCHAR, model VARCHAR, prompt_version VARCHAR,
+        raw VARCHAR, reason VARCHAR)""")
+    if good:
+        con.executemany("INSERT INTO gold_ticket_labels VALUES (?, ?, ?, ?, ?)", good)
+    if bad:
+        con.executemany("INSERT INTO llm_label_quarantine VALUES (?, ?, ?, ?, ?, ?)", bad)
+    return {"labeled": len(good), "quarantined": len(bad),
+            "calls": llm.calls - calls_before, "cache_hits": len(tickets) - len(todo),
+            "est_tokens": est_tokens, "est_usd": round(est_usd, 6)}
