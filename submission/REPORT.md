@@ -4,7 +4,7 @@ Phần phân tích tối đa một trang, không tính output ở phần 5.
 Định dạng tham chiếu và phạm vi tính trang: [SUBMISSION.md](../docs/SUBMISSION.md).
 
 **Họ tên / MSSV:** Nguyễn Thị Hạ / 2A202602536
-**Repo:** https://github.com/nguyenha59/K4-Track02-Day17-Data-Pipeline-Engineering
+**Repo:** https://github.com/nguyenha59/K4-Track02-Day17-NguyenThiHa-2A202602536-DataPipelineEngineering
 **Commit bài nộp:** `7d18db1`
 **AI đã dùng và phạm vi hỗ trợ (hoặc không dùng):** Claude Code (Claude Opus 5.5) — đọc repo, đề xuất 3 bản sửa; tôi đã review và tự giải thích từng thay đổi.
 **Nguồn tham khảo khác (nếu có):** slide Ngày 17, README/docs của repo.
